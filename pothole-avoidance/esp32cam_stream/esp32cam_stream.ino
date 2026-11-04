@@ -47,17 +47,17 @@
 #include "soc/rtc_cntl_reg.h"
 
 // ======================================================================================
-// USER NETWORK CONFIGURATION (UPDATE WITH YOUR LOCAL WI-FI DETAILS)
+// USER NETWORK CONFIGURATION (CONNECTED TO ESP8266 AP: "pothole car")
 // ======================================================================================
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID     = "Easitronics";
+const char* WIFI_PASSWORD = "123456789";
 
-// Optional Static IP Configuration (set to false to use DHCP)
+// Static IP Configuration on ESP8266 AP Subnet (192.168.4.2)
 const bool  USE_STATIC_IP = false;
-IPAddress   local_IP(192, 168, 1, 50);
-IPAddress   gateway(192, 168, 1, 1);
+IPAddress   local_IP(192, 168, 4, 2);
+IPAddress   gateway(192, 168, 4, 1);
 IPAddress   subnet(255, 255, 255, 0);
-IPAddress   primaryDNS(8, 8, 8, 8);
+IPAddress   primaryDNS(192, 168, 4, 1);
 
 // ======================================================================================
 // AI-THINKER ESP32-CAM PIN DEFINITIONS
@@ -164,6 +164,58 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 // ======================================================================================
 // START HTTP STREAM SERVER ON PORT 81
 // ======================================================================================
+
+// ======================================================================================
+// RUNTIME CAMERA SENSOR CONTROL HANDLER (/control?var=vflip&val=0|1)
+// ======================================================================================
+static esp_err_t cmd_handler(httpd_req_t *req) {
+    char*  buf;
+    size_t buf_len;
+    char variable[32] = {0,};
+    char value[32] = {0,};
+
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = (char*)malloc(buf_len);
+        if(!buf){
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "var", variable, sizeof(variable)) == ESP_OK &&
+                httpd_query_key_value(buf, "val", value, sizeof(value)) == ESP_OK) {
+            } else {
+                free(buf);
+                httpd_resp_send_404(req);
+                return ESP_FAIL;
+            }
+        } else {
+            free(buf);
+            httpd_resp_send_404(req);
+            return ESP_FAIL;
+        }
+        free(buf);
+    } else {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    int val = atoi(value);
+    sensor_t * s = esp_camera_sensor_get();
+    int res = 0;
+
+    if(!strcmp(variable, "vflip")) res = s->set_vflip(s, val);
+    else if(!strcmp(variable, "hmirror")) res = s->set_hmirror(s, val);
+    else res = -1;
+
+    if(res){
+        return httpd_resp_send_500(req);
+    }
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "OK", 2);
+}
+
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 81;
@@ -179,6 +231,15 @@ void startCameraServer() {
     Serial.printf("[HTTP] Starting stream server on port %d...\n", config.server_port);
     if (httpd_start(&stream_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
+
+        httpd_uri_t cmd_uri = {
+            .uri       = "/control",
+            .method    = HTTP_GET,
+            .handler   = cmd_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(stream_httpd, &cmd_uri);
+
         Serial.println("[HTTP] Stream server started successfully!");
     } else {
         Serial.println("[ERROR] Failed to start HTTP stream server!");
@@ -242,8 +303,8 @@ bool initCamera() {
         s->set_whitebal(s, 1);       // Auto white balance
         s->set_awb_gain(s, 1);       // AWB Gain
         s->set_wb_mode(s, 0);        // Auto WB mode
-        s->set_vflip(s, 0);          // Flip vertical if camera mounted upside down
-        s->set_hmirror(s, 0);        // Mirror horizontal
+        s->set_vflip(s, 1);          // 1 = Inverted (fixes upside-down camera mounting)
+        s->set_hmirror(s, 1);        // 1 = Inverted (fixes horizontal mirror)
     }
 
     Serial.println("[CAM] Camera sensor initialized successfully.");

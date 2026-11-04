@@ -19,12 +19,13 @@ import os
 # ======================================================================================
 
 # IP of the ESP32-CAM video streamer node
-ESP32_CAM_IP = "192.168.1.50"
+# IP of the ESP32-CAM video streamer (Connected to ESP8266 AP)
+ESP32_CAM_IP = "10.135.210.5"
 STREAM_PORT = 81
 STREAM_URL = f"http://{ESP32_CAM_IP}:{STREAM_PORT}/stream"
 
-# IP of the ESP8266 vehicle motion controller node
-ESP8266_IP = "192.168.1.60"
+# IP of the ESP8266 AP Server vehicle controller
+ESP8266_IP = "10.135.210.9"
 ESP8266_PORT = 80
 ESP8266_BASE_URL = f"http://{ESP8266_IP}:{ESP8266_PORT}"
 
@@ -34,9 +35,9 @@ STATUS_ENDPOINT  = f"{ESP8266_BASE_URL}/status"
 MODE_ENDPOINT    = f"{ESP8266_BASE_URL}/mode"
 DRIVE_ENDPOINT   = f"{ESP8266_BASE_URL}/drive"
 
-# HTTP Client timeouts (short to avoid any UI or video thread latency)
-HTTP_CONNECT_TIMEOUT_SEC = 0.40   # 400 ms connection timeout
-HTTP_READ_TIMEOUT_SEC    = 0.50   # 500 ms response read timeout
+# HTTP Client timeouts (dispatched asynchronously in background worker threads)
+HTTP_CONNECT_TIMEOUT_SEC = 1.00   # 1.0 s connection timeout
+HTTP_READ_TIMEOUT_SEC    = 1.50   # 1.5 s response read timeout
 
 # Optional Secondary Telegram Dispatcher from Laptop
 TELEGRAM_BOT_TOKEN = "9138292752:AAFdtNKDLzFQVDEwx8mSyhJ1kMcRNApC0xg"

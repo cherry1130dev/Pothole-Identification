@@ -1,674 +1,411 @@
 /**
  * ======================================================================================
  * PROJECT: AI-Driven Pothole Identification and Smart Obstacle Avoidance System
- * MODULE:  ESP8266 Main Vehicle Motion & Safety Controller
+ * MODULE:  ESP8266 Main Vehicle Motion & Safety Controller (Station Mode with Internet)
  * FILE:    esp8266_controller.ino
  * ======================================================================================
  * 
  * DESCRIPTION:
- * Non-blocking cooperative state machine implementing:
- * 1. Parallel 3-sensor ultrasonic acquisition with median filtering.
- * 2. Obstacle avoidance finite state machine (CRUISE, SLOW, AVOID, PASS, RETURN, BLOCKED).
- * 3. Priority arbitration (Obstacle avoidance ALWAYS preempts pothole slowdown).
- * 4. Embedded HTTP REST API (/pothole, /status, /mode, /drive).
- * 5. Asynchronous queued Telegram Bot alerts over HTTPS.
- * 6. Multi-level fail-safes (Laptop heartbeat watchdog, Wi-Fi auto-recovery).
+ * 1. Connects to local Wi-Fi Router (Station Mode) so Telegram messages work reliably!
+ * 2. Uses proven, rock-solid ultrasonic measurement via getDistance(echoPin) with pulseIn.
+ * 3. Obstacle Avoidance Rules:
+ *    - Center detected (<= 20 cm): Stop -> Turn LEFT for 1.0 sec -> Continue path
+ *    - Left detected (<= 20 cm):   Turn RIGHT for 1.5 sec -> Continue path
+ *    - Right detected (<= 20 cm):  Turn LEFT for 1.5 sec -> Continue path
+ * 4. Pothole Detection Integration:
+ *    - Receives /pothole?state=1 from Laptop AI -> Decelerates to SLOW crawl mode.
+ *    - Receives /pothole?state=0 from Laptop AI -> Resumes CRUISE speed.
+ * 5. Serves Web Control Dashboard from dashboard.h at http://<ESP8266_IP>/
  * ======================================================================================
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <WiFiClientSecure.h>
-#include <ArduinoJson.h>
 #include "config.h"
+#include "dashboard.h"
 
 // ======================================================================================
-// ENUMERATIONS & DATA STRUCTURES
+// FORWARD DECLARATIONS (Prevents compiler scope errors)
 // ======================================================================================
-
-enum VehicleMode {
-    MODE_AUTO,
-    MODE_MANUAL
-};
-
-enum VehicleState {
-    STATE_CRUISE,   // Normal forward speed
-    STATE_SLOW,     // Pothole rough-patch crawl
-    STATE_AVOID,    // Steering away from detected obstacle
-    STATE_PASS,     // Bypassing obstacle in adjacent lane
-    STATE_RETURN,   // Counter-steering back to original heading
-    STATE_BLOCKED   // Trapped; all directions obstructed
-};
-
-enum AvoidDirection {
-    AVOID_NONE,
-    AVOID_LEFT,
-    AVOID_RIGHT
-};
-
-enum AlertType {
-    ALERT_BOOT,
-    ALERT_POTHOLE,
-    ALERT_AVOID_LEFT,
-    ALERT_AVOID_RIGHT,
-    ALERT_BLOCKED
-};
+void moveForward();
+void moveBackward();
+void turnLeft();
+void turnRight();
+void stopMotors();
+void setMotorSpeed(uint8_t speed);
+long getDistance(uint8_t echoPin);
+void runAutonomousMode();
+void handleRoot();
+void handleStatus();
+void handlePothole();
+void handleDrive();
+void handleMode();
 
 // ======================================================================================
 // GLOBAL STATE VARIABLES
 // ======================================================================================
+bool isAutoMode = false;
+int potholeFlag = 0; // 0 = Clear road, 1 = Pothole rough patch
+uint8_t currentSpeed = PWM_CRUISE;
 
-VehicleMode    currentMode        = MODE_AUTO;
-VehicleState   currentState       = STATE_CRUISE;
-AvoidDirection avoidDirection     = AVOID_NONE;
+// Live Distances (cm)
+long distFront = 999;
+long distLeft  = 999;
+long distRight = 999;
 
-int  potholeFlag                  = 0;       // 1 = slow down, 0 = cruise
-int  currentSpeedPwm              = PWM_CRUISE;
-char manualDriveCmd               = 'S';
-
-// Timers (millis tracking)
-unsigned long stateStartTimeMs    = 0;
-unsigned long lastUsSampleMs      = 0;
-unsigned long lastLaptopCmdMs     = 0;
-unsigned long lastBlockedRetryMs  = 0;
-unsigned long lastWifiCheckMs     = 0;
-
-// Telegram Alert Queue & Cooldowns
-struct TelegramAlert {
-    String    message;
-    AlertType type;
-};
-
-TelegramAlert alertQueue[TELEGRAM_MAX_QUEUE];
-int alertQueueHead = 0;
-int alertQueueTail = 0;
-int alertQueueCount = 0;
-
-unsigned long lastAlertTimeMs[5] = {0, 0, 0, 0, 0}; // Cooldowns for each AlertType
-
-// Ultrasonic Filter Buffers (Median of 3)
-float frontHistory[3] = {100.0f, 100.0f, 100.0f};
-float leftHistory[3]  = {100.0f, 100.0f, 100.0f};
-float rightHistory[3] = {100.0f, 100.0f, 100.0f};
-int usHistoryIndex = 0;
-
-float frontDistCm = 100.0f;
-float leftDistCm  = 100.0f;
-float rightDistCm = 100.0f;
-
-// Web Server
 ESP8266WebServer server(HTTP_SERVER_PORT);
+
 
 // ======================================================================================
 // MOTOR ACTUATION SUBSYSTEM (L298N)
 // ======================================================================================
 
-void motorsInit() {
+void setMotorSpeed(uint8_t speed) {
+    currentSpeed = speed;
+    if (speed >= 250) {
+        digitalWrite(PIN_MOTOR_PWM, HIGH);
+    } else {
+        analogWrite(PIN_MOTOR_PWM, currentSpeed);
+    }
+}
+
+void moveForward() {
+    digitalWrite(PIN_MOTOR_PWM, HIGH);
+    digitalWrite(PIN_MOTOR_IN1, HIGH); digitalWrite(PIN_MOTOR_IN2, LOW);
+    digitalWrite(PIN_MOTOR_IN3, HIGH); digitalWrite(PIN_MOTOR_IN4, LOW);
+}
+
+void moveBackward() {
+    digitalWrite(PIN_MOTOR_PWM, HIGH);
+    digitalWrite(PIN_MOTOR_IN1, LOW);  digitalWrite(PIN_MOTOR_IN2, HIGH);
+    digitalWrite(PIN_MOTOR_IN3, LOW);  digitalWrite(PIN_MOTOR_IN4, HIGH);
+}
+
+void turnLeft() {
+    // Pivot turn left: Left reverse, Right forward
+    digitalWrite(PIN_MOTOR_PWM, HIGH);
+    digitalWrite(PIN_MOTOR_IN1, LOW);  digitalWrite(PIN_MOTOR_IN2, HIGH);
+    digitalWrite(PIN_MOTOR_IN3, HIGH); digitalWrite(PIN_MOTOR_IN4, LOW);
+}
+
+void turnRight() {
+    // Pivot turn right: Left forward, Right reverse
+    digitalWrite(PIN_MOTOR_PWM, HIGH);
+    digitalWrite(PIN_MOTOR_IN1, HIGH); digitalWrite(PIN_MOTOR_IN2, LOW);
+    digitalWrite(PIN_MOTOR_IN3, LOW);  digitalWrite(PIN_MOTOR_IN4, HIGH);
+}
+
+void stopMotors() {
+    digitalWrite(PIN_MOTOR_IN1, LOW); digitalWrite(PIN_MOTOR_IN2, LOW);
+    digitalWrite(PIN_MOTOR_IN3, LOW); digitalWrite(PIN_MOTOR_IN4, LOW);
+}
+
+
+// ======================================================================================
+// ULTRASONIC SENSOR MEASUREMENT (HC-SR04)
+// ======================================================================================
+
+long getDistance(uint8_t echoPin) {
+    // Ensure trigger line is LOW
+    digitalWrite(PIN_US_TRIG, LOW);
+    delayMicroseconds(2);
+
+    // Send 10us trigger pulse
+    digitalWrite(PIN_US_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_US_TRIG, LOW);
+
+    // Read echo pulse length (timeout at 30ms to prevent blocking too long)
+    long duration = pulseIn(echoPin, HIGH, 30000);
+
+    if (duration == 0) return 999; // No echo received, assume clear distance
+
+    // Calculate distance in cm (Speed of sound = 343 m/s)
+    return (duration / 2) * 0.0343;
+}
+
+
+// ======================================================================================
+// AUTONOMOUS OBSTACLE AVOIDANCE & DRIVING LOGIC
+// ======================================================================================
+
+void runAutonomousMode() {
+    // 1. Read Front distance
+    distFront = getDistance(PIN_US_ECHO_FRONT);
+    delay(30); // Prevent acoustic crosstalk between sensor readings
+
+    // Rule 1: Center obstacle detected (<= 20 cm) -> STOP, then turn LEFT for 1.0 sec, continue forward
+    if (distFront <= OBSTACLE_THRESH) {
+        Serial.printf("[AVOID] Center obstacle (%ld cm) -> STOP & Turn LEFT for 1.0s\n", distFront);
+        stopMotors();
+        delay(150);
+
+        digitalWrite(PIN_MOTOR_PWM, HIGH);
+        turnLeft();
+        delay(TURN_CENTER_MS); // 1.0 sec (1000 ms)
+        stopMotors();
+        delay(100);
+
+        moveForward();
+        return;
+    }
+
+    // 2. Read Left distance
+    distLeft = getDistance(PIN_US_ECHO_LEFT);
+    delay(30);
+
+    // Rule 2: Left obstacle detected (<= 20 cm) -> Turn RIGHT for 1.5 sec, continue forward
+    if (distLeft <= OBSTACLE_THRESH) {
+        Serial.printf("[AVOID] Left obstacle (%ld cm) -> Turn RIGHT for 1.5s\n", distLeft);
+        digitalWrite(PIN_MOTOR_PWM, HIGH);
+        turnRight();
+        delay(TURN_LEFT_MS); // 1.5 sec (1500 ms)
+        stopMotors();
+        delay(100);
+
+        moveForward();
+        return;
+    }
+
+    // 3. Read Right distance
+    distRight = getDistance(PIN_US_ECHO_RIGHT);
+    delay(30);
+
+    // Rule 3: Right obstacle detected (<= 20 cm) -> Turn LEFT for 1.5 sec, continue forward
+    if (distRight <= OBSTACLE_THRESH) {
+        Serial.printf("[AVOID] Right obstacle (%ld cm) -> Turn LEFT for 1.5s\n", distRight);
+        digitalWrite(PIN_MOTOR_PWM, HIGH);
+        turnLeft();
+        delay(TURN_RIGHT_MS); // 1.5 sec (1500 ms)
+        stopMotors();
+        delay(100);
+
+        moveForward();
+        return;
+    }
+
+    // Road Clear -> Drive Forward
+    // If Laptop AI signals a pothole, slow down
+    if (potholeFlag == 1) {
+        analogWrite(PIN_MOTOR_PWM, PWM_SLOW); // Slow crawl for rough road
+        moveForward();
+    } else {
+        digitalWrite(PIN_MOTOR_PWM, HIGH);     // Full cruise power
+        moveForward();
+    }
+}
+
+
+// ======================================================================================
+// WEB SERVER ROUTES & REST API
+// ======================================================================================
+
+void handleRoot() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleStatus() {
+    String json = "{";
+    json += "\"mode\":\"" + String(isAutoMode ? "AUTO" : "MANUAL") + "\",";
+    json += "\"front\":" + String(distFront) + ",";
+    json += "\"left\":" + String(distLeft) + ",";
+    json += "\"right\":" + String(distRight) + ",";
+    json += "\"pothole\":" + String(potholeFlag) + ",";
+    json += "\"speed\":" + String(currentSpeed);
+    json += "}";
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", json);
+}
+
+void handlePothole() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (server.hasArg("state")) {
+        potholeFlag = server.arg("state").toInt();
+        if (potholeFlag == 1) {
+            setMotorSpeed(PWM_SLOW);
+        } else {
+            setMotorSpeed(PWM_CRUISE);
+        }
+        server.send(200, "application/json", "{\"status\":\"ok\",\"pothole\":" + String(potholeFlag) + "}");
+    } else {
+        server.send(400, "text/plain", "Missing state parameter");
+    }
+}
+
+void handleDrive() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (server.hasArg("cmd")) {
+        isAutoMode = false;
+        digitalWrite(PIN_MOTOR_PWM, HIGH);
+        String cmd = server.arg("cmd");
+        cmd.toUpperCase();
+        char c = cmd.charAt(0);
+
+        switch (c) {
+            case 'F': moveForward(); break;
+            case 'B': moveBackward(); break;
+            case 'L': turnLeft(); break;
+            case 'R': turnRight(); break;
+            case 'S': stopMotors(); break;
+            default: break;
+        }
+        server.send(200, "application/json", "{\"status\":\"ok\",\"cmd\":\"" + cmd + "\"}");
+    } else {
+        server.send(400, "text/plain", "Missing cmd parameter");
+    }
+}
+
+void handleMode() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (server.hasArg("auto")) {
+        int autoVal = server.arg("auto").toInt();
+        isAutoMode = (autoVal == 1);
+        if (!isAutoMode) {
+            stopMotors();
+        }
+        server.send(200, "application/json", "{\"status\":\"ok\",\"auto\":" + String(isAutoMode) + "}");
+    } else {
+        server.send(400, "text/plain", "Missing auto parameter");
+    }
+}
+
+
+// ======================================================================================
+// ARDUINO SETUP & MAIN LOOP
+// ======================================================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(200);
+    Serial.println("\n\n=======================================================");
+    Serial.println("  AI-DRIVEN POTHOLE CAR & SAFETY CONTROLLER            ");
+    Serial.println("=======================================================");
+
+    // Initialize Motor Pins
     pinMode(PIN_MOTOR_IN1, OUTPUT);
     pinMode(PIN_MOTOR_IN2, OUTPUT);
     pinMode(PIN_MOTOR_IN3, OUTPUT);
     pinMode(PIN_MOTOR_IN4, OUTPUT);
     pinMode(PIN_MOTOR_PWM, OUTPUT);
 
-    // Set ESP8266 PWM range to standard 0-255
-    analogWriteRange(255);
-    analogWriteFreq(1000); // 1 kHz PWM frequency
+    // Hold PWM HIGH to keep motors enabled with maximum torque
+    digitalWrite(PIN_MOTOR_PWM, HIGH);
+    stopMotors();
+    Serial.println("[MOTORS] L298N initialized and stopped.");
 
-    motorsStop();
-    Serial.println("[MOTORS] L298N driver initialized.");
-}
-
-void motorsSetSpeed(uint8_t speed) {
-    currentSpeedPwm = speed;
-    analogWrite(PIN_MOTOR_PWM, currentSpeedPwm);
-}
-
-void motorsForward() {
-    digitalWrite(PIN_MOTOR_IN1, HIGH);
-    digitalWrite(PIN_MOTOR_IN2, LOW);
-    digitalWrite(PIN_MOTOR_IN3, HIGH);
-    digitalWrite(PIN_MOTOR_IN4, LOW);
-}
-
-void motorsBackward() {
-    digitalWrite(PIN_MOTOR_IN1, LOW);
-    digitalWrite(PIN_MOTOR_IN2, HIGH);
-    digitalWrite(PIN_MOTOR_IN3, LOW);
-    digitalWrite(PIN_MOTOR_IN4, HIGH);
-}
-
-void motorsTurnLeft() {
-    // Pivot turn: Left motor reverse, Right motor forward
-    digitalWrite(PIN_MOTOR_IN1, LOW);
-    digitalWrite(PIN_MOTOR_IN2, HIGH);
-    digitalWrite(PIN_MOTOR_IN3, HIGH);
-    digitalWrite(PIN_MOTOR_IN4, LOW);
-}
-
-void motorsTurnRight() {
-    // Pivot turn: Left motor forward, Right motor reverse
-    digitalWrite(PIN_MOTOR_IN1, HIGH);
-    digitalWrite(PIN_MOTOR_IN2, LOW);
-    digitalWrite(PIN_MOTOR_IN3, LOW);
-    digitalWrite(PIN_MOTOR_IN4, HIGH);
-}
-
-void motorsStop() {
-    digitalWrite(PIN_MOTOR_IN1, LOW);
-    digitalWrite(PIN_MOTOR_IN2, LOW);
-    digitalWrite(PIN_MOTOR_IN3, LOW);
-    digitalWrite(PIN_MOTOR_IN4, LOW);
-    analogWrite(PIN_MOTOR_PWM, 0);
-}
-
-// ======================================================================================
-// PARALLEL ULTRASONIC ACQUISITION WITH MEDIAN FILTER
-// ======================================================================================
-
-void ultrasonicsInit() {
+    // Initialize Ultrasonic Pins
     pinMode(PIN_US_TRIG, OUTPUT);
+    digitalWrite(PIN_US_TRIG, LOW);
     pinMode(PIN_US_ECHO_FRONT, INPUT);
     pinMode(PIN_US_ECHO_LEFT, INPUT);
     pinMode(PIN_US_ECHO_RIGHT, INPUT);
+    Serial.println("[ULTRASONICS] Sensors initialized.");
 
-    digitalWrite(PIN_US_TRIG, LOW);
-    Serial.println("[SENSORS] HC-SR04 parallel ultrasonic array initialized.");
-}
-
-float calculateMedian3(float a, float b, float c) {
-    if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
-    if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
-    return c;
-}
-
-/**
- * Executes a single parallel pulse on shared TRIG and measures FRONT, LEFT,
- * and RIGHT echo times simultaneously in a high-speed microsecond polling loop.
- */
-void sampleUltrasonicsParallel() {
-    // 1. Send clean 10 µs trigger pulse
-    digitalWrite(PIN_US_TRIG, LOW);
-    delayMicroseconds(4);
-    digitalWrite(PIN_US_TRIG, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(PIN_US_TRIG, LOW);
-
-    // 2. Wait for echo pulses to start (timeout 2500 µs)
-    unsigned long waitStart = micros();
-    bool echoStarted = false;
-    while (micros() - waitStart < 2500) {
-        if (digitalRead(PIN_US_ECHO_FRONT) || digitalRead(PIN_US_ECHO_LEFT) || digitalRead(PIN_US_ECHO_RIGHT)) {
-            echoStarted = true;
-            break;
-        }
-    }
-
-    if (!echoStarted) {
-        // No echo detected, return max distance
-        return;
-    }
-
-    unsigned long pulseStartTime = micros();
-    unsigned long frontDuration = 0;
-    unsigned long leftDuration  = 0;
-    unsigned long rightDuration = 0;
-
-    bool frontDone = false;
-    bool leftDone  = false;
-    bool rightDone = false;
-
-    // 3. Parallel polling loop (runs until all 3 have fallen or timeout reached)
-    while (micros() - pulseStartTime < US_TIMEOUT_MICROS) {
-        unsigned long now = micros();
-
-        if (!frontDone && digitalRead(PIN_US_ECHO_FRONT) == LOW) {
-            frontDuration = now - pulseStartTime;
-            frontDone = true;
-        }
-        if (!leftDone && digitalRead(PIN_US_ECHO_LEFT) == LOW) {
-            leftDuration = now - pulseStartTime;
-            leftDone = true;
-        }
-        if (!rightDone && digitalRead(PIN_US_ECHO_RIGHT) == LOW) {
-            rightDuration = now - pulseStartTime;
-            rightDone = true;
-        }
-
-        if (frontDone && leftDone && rightDone) {
-            break;
-        }
-    }
-
-    // Convert microseconds to centimeters (Speed of sound: 343 m/s -> 58.2 µs/cm)
-    float rawFront = frontDone ? (frontDuration / 58.2f) : 400.0f;
-    float rawLeft  = leftDone  ? (leftDuration  / 58.2f) : 400.0f;
-    float rawRight = rightDone ? (rightDuration / 58.2f) : 400.0f;
-
-    // Filter out invalid zero or negative readings
-    if (rawFront <= 1.0f || rawFront > 400.0f) rawFront = 400.0f;
-    if (rawLeft  <= 1.0f || rawLeft  > 400.0f) rawLeft  = 400.0f;
-    if (rawRight <= 1.0f || rawRight > 400.0f) rawRight = 400.0f;
-
-    // Store in circular buffer
-    frontHistory[usHistoryIndex] = rawFront;
-    leftHistory[usHistoryIndex]  = rawLeft;
-    rightHistory[usHistoryIndex] = rawRight;
-    usHistoryIndex = (usHistoryIndex + 1) % 3;
-
-    // Compute median of 3 samples to reject stray spikes
-    frontDistCm = calculateMedian3(frontHistory[0], frontHistory[1], frontHistory[2]);
-    leftDistCm  = calculateMedian3(leftHistory[0], leftHistory[1], leftHistory[2]);
-    rightDistCm = calculateMedian3(rightHistory[0], rightHistory[1], rightHistory[2]);
-}
-
-// ======================================================================================
-// TELEGRAM ALERT QUEUE & DISPATCHER (NON-BLOCKING)
-// ======================================================================================
-
-void enqueueTelegramAlert(const String& msg, AlertType type) {
-    unsigned long now = millis();
-    // Check cooldown for this specific alert type
-    if (now - lastAlertTimeMs[type] < TELEGRAM_COOLDOWN_MS && type != ALERT_BOOT) {
-        Serial.printf("[TELEGRAM] Alert type %d throttled by cooldown.\n", type);
-        return;
-    }
-
-    if (alertQueueCount >= TELEGRAM_MAX_QUEUE) {
-        Serial.println("[TELEGRAM] Queue full! Dropping oldest alert.");
-        alertQueueHead = (alertQueueHead + 1) % TELEGRAM_MAX_QUEUE;
-        alertQueueCount--;
-    }
-
-    alertQueue[alertQueueTail].message = msg;
-    alertQueue[alertQueueTail].type    = type;
-    alertQueueTail = (alertQueueTail + 1) % TELEGRAM_MAX_QUEUE;
-    alertQueueCount++;
-
-    lastAlertTimeMs[type] = now;
-    Serial.printf("[TELEGRAM] Enqueued: %s\n", msg.c_str());
-}
-
-void processTelegramQueue() {
-    if (alertQueueCount == 0 || WiFi.status() != WL_CONNECTED) {
-        return;
-    }
-
-    String botToken = TELEGRAM_BOT_TOKEN;
-    String chatId   = TELEGRAM_CHAT_ID;
-
-    // Skip if placeholders remain
-    if (botToken.startsWith("YOUR_") || chatId.startsWith("YOUR_")) {
-        // Discard alert to prevent queue clogging
-        alertQueueHead = (alertQueueHead + 1) % TELEGRAM_MAX_QUEUE;
-        alertQueueCount--;
-        return;
-    }
-
-    TelegramAlert currentAlert = alertQueue[alertQueueHead];
-    alertQueueHead = (alertQueueHead + 1) % TELEGRAM_MAX_QUEUE;
-    alertQueueCount--;
-
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure(); // Bypass X.509 cert validation for speed and RAM efficiency
-    secureClient.setTimeout(3000); // 3-second hard timeout
-
-    const char* host = "api.telegram.org";
-    if (!secureClient.connect(host, 443)) {
-        Serial.println("[TELEGRAM] SSL Connection failed to api.telegram.org");
-        return;
-    }
-
-    // Build URL-encoded POST payload
-    StaticJsonDocument<256> doc;
-    doc["chat_id"] = chatId;
-    doc["text"]    = currentAlert.message;
-    String payload;
-    serializeJson(doc, payload);
-
-    String request = String("POST /bot") + botToken + "/sendMessage HTTP/1.1\r\n" +
-                     "Host: " + host + "\r\n" +
-                     "Content-Type: application/json\r\n" +
-                     "Content-Length: " + payload.length() + "\r\n" +
-                     "Connection: close\r\n\r\n" +
-                     payload;
-
-    secureClient.print(request);
-    Serial.printf("[TELEGRAM] Alert sent: %s\n", currentAlert.message.c_str());
-}
-
-// ======================================================================================
-// REST API HTTP REQUEST HANDLERS
-// ======================================================================================
-
-void handlePothole() {
-    if (server.hasArg("state")) {
-        int newState = server.arg("state").toInt();
-        potholeFlag = (newState == 1) ? 1 : 0;
-        lastLaptopCmdMs = millis();
-
-        if (potholeFlag == 1) {
-            enqueueTelegramAlert("⚠️ Pothole detected ahead - slowing down", ALERT_POTHOLE);
-        }
-
-        StaticJsonDocument<128> doc;
-        doc["status"]  = "ok";
-        doc["pothole"] = potholeFlag;
-        String resp;
-        serializeJson(doc, resp);
-        server.send(200, "application/json", resp);
-
-        Serial.printf("[API] Pothole state updated to: %d\n", potholeFlag);
-    } else {
-        server.send(400, "application/json", "{\"error\":\"Missing 'state' query param\"}");
-    }
-}
-
-void handleStatus() {
-    StaticJsonDocument<300> doc;
-    doc["mode"]       = (currentMode == MODE_AUTO) ? "AUTO" : "MANUAL";
-    
-    switch (currentState) {
-        case STATE_CRUISE:  doc["state"] = "CRUISE"; break;
-        case STATE_SLOW:    doc["state"] = "SLOW"; break;
-        case STATE_AVOID:   doc["state"] = "AVOID"; break;
-        case STATE_PASS:    doc["state"] = "PASS"; break;
-        case STATE_RETURN:  doc["state"] = "RETURN"; break;
-        case STATE_BLOCKED: doc["state"] = "BLOCKED"; break;
-    }
-
-    doc["speed"]      = currentSpeedPwm;
-    doc["pothole"]    = potholeFlag;
-    doc["front_cm"]   = serialized(String(frontDistCm, 1));
-    doc["left_cm"]    = serialized(String(leftDistCm, 1));
-    doc["right_cm"]   = serialized(String(rightDistCm, 1));
-    doc["uptime_s"]   = millis() / 1000;
-
-    String resp;
-    serializeJson(doc, resp);
-    server.send(200, "application/json", resp);
-}
-
-void handleMode() {
-    if (server.hasArg("auto")) {
-        int isAuto = server.arg("auto").toInt();
-        currentMode = (isAuto == 1) ? MODE_AUTO : MODE_MANUAL;
-        if (currentMode == MODE_MANUAL) {
-            motorsStop();
-        }
-        server.send(200, "application/json", String("{\"status\":\"ok\",\"mode\":\"") + ((currentMode == MODE_AUTO) ? "AUTO" : "MANUAL") + "\"}");
-        Serial.printf("[API] Vehicle Mode set to: %s\n", (currentMode == MODE_AUTO) ? "AUTO" : "MANUAL");
-    } else {
-        server.send(400, "application/json", "{\"error\":\"Missing 'auto' param\"}");
-    }
-}
-
-void handleDrive() {
-    if (server.hasArg("cmd")) {
-        String cmd = server.arg("cmd");
-        cmd.toUpperCase();
-        manualDriveCmd = cmd.charAt(0);
-
-        if (currentMode == MODE_MANUAL) {
-            motorsSetSpeed(PWM_CRUISE);
-            switch (manualDriveCmd) {
-                case 'F': motorsForward(); break;
-                case 'B': motorsBackward(); break;
-                case 'L': motorsTurnLeft(); break;
-                case 'R': motorsTurnRight(); break;
-                case 'S': default: motorsStop(); break;
-            }
-        }
-        server.send(200, "application/json", String("{\"status\":\"ok\",\"cmd\":\"") + manualDriveCmd + "\"}");
-        Serial.printf("[API] Manual command: %c\n", manualDriveCmd);
-    } else {
-        server.send(400, "application/json", "{\"error\":\"Missing 'cmd' param\"}");
-    }
-}
-
-void handleNotFound() {
-    server.send(404, "text/plain", "404: Not Found");
-}
-
-void setupHttpServer() {
-    server.on("/pothole", HTTP_GET, handlePothole);
-    server.on("/status",  HTTP_GET, handleStatus);
-    server.on("/mode",    HTTP_GET, handleMode);
-    server.on("/drive",   HTTP_GET, handleDrive);
-    server.onNotFound(handleNotFound);
-
-    server.begin();
-    Serial.println("[HTTP] REST API server started on port 80.");
-}
-
-// ======================================================================================
-// AUTONOMOUS FINITE STATE MACHINE (COOPERATIVE NON-BLOCKING)
-// ======================================================================================
-
-void executeStateMachine() {
-    if (currentMode != MODE_AUTO) {
-        return; // Manual mode bypasses autonomous FSM
-    }
-
-    unsigned long now = millis();
-
-    // ----------------------------------------------------------------------------------
-    // TOP SAFETY PRIORITY: OBSTACLE DETECTION ARBITRATION
-    // If obstacle is < 25 cm ahead, trigger evasion immediately (preempts CRUISE or SLOW)
-    // ----------------------------------------------------------------------------------
-    if ((currentState == STATE_CRUISE || currentState == STATE_SLOW) && (frontDistCm < OBSTACLE_FRONT_THRESH)) {
-        Serial.printf("[FSM] Front obstacle detected at %.1f cm! Evaluating escape path.\n", frontDistCm);
-
-        // Check for deadlock (blocked on all sides)
-        if (leftDistCm < OBSTACLE_DEADLOCK && rightDistCm < OBSTACLE_DEADLOCK) {
-            currentState = STATE_BLOCKED;
-            stateStartTimeMs = now;
-            motorsStop();
-            enqueueTelegramAlert("🚨 Emergency: Path blocked in all directions! Vehicle stopped.", ALERT_BLOCKED);
-            Serial.println("[FSM] -> Entered STATE_BLOCKED");
-            return;
-        }
-
-        // Steer toward the side with greater clearance
-        if (leftDistCm > rightDistCm) {
-            avoidDirection = AVOID_LEFT;
-            currentState = STATE_AVOID;
-            stateStartTimeMs = now;
-            motorsSetSpeed(PWM_TURN);
-            motorsTurnLeft();
-            enqueueTelegramAlert("🚧 Obstacle ahead - avoiding to LEFT", ALERT_AVOID_LEFT);
-            Serial.println("[FSM] -> Entered STATE_AVOID (Turning LEFT)");
-        } else {
-            avoidDirection = AVOID_RIGHT;
-            currentState = STATE_AVOID;
-            stateStartTimeMs = now;
-            motorsSetSpeed(PWM_TURN);
-            motorsTurnRight();
-            enqueueTelegramAlert("🚧 Obstacle ahead - avoiding to RIGHT", ALERT_AVOID_RIGHT);
-            Serial.println("[FSM] -> Entered STATE_AVOID (Turning RIGHT)");
-        }
-        return;
-    }
-
-    // ----------------------------------------------------------------------------------
-    // STATE TRANSITION EXECUTION
-    // ----------------------------------------------------------------------------------
-    switch (currentState) {
-
-        case STATE_CRUISE:
-            if (potholeFlag == 1) {
-                currentState = STATE_SLOW;
-                motorsSetSpeed(PWM_SLOW);
-                motorsForward();
-                Serial.println("[FSM] -> Entered STATE_SLOW (Pothole rough patch)");
-            } else {
-                motorsSetSpeed(PWM_CRUISE);
-                motorsForward();
-            }
-            break;
-
-        case STATE_SLOW:
-            if (potholeFlag == 0) {
-                currentState = STATE_CRUISE;
-                motorsSetSpeed(PWM_CRUISE);
-                motorsForward();
-                Serial.println("[FSM] -> Entered STATE_CRUISE (Road clear)");
-            } else {
-                motorsSetSpeed(PWM_SLOW);
-                motorsForward();
-            }
-            break;
-
-        case STATE_AVOID:
-            // Pivot turn for calibrated turn duration
-            if (now - stateStartTimeMs >= TURN_DURATION_MS) {
-                currentState = STATE_PASS;
-                stateStartTimeMs = now;
-                motorsSetSpeed(potholeFlag ? PWM_SLOW : PWM_CRUISE);
-                motorsForward();
-                Serial.println("[FSM] -> Entered STATE_PASS (Bypassing obstacle)");
-            }
-            break;
-
-        case STATE_PASS:
-            {
-                // Monitor side sensor facing the obstacle
-                bool sideClear = false;
-                if (avoidDirection == AVOID_LEFT) {
-                    // We turned left, so obstacle is to our right
-                    if (rightDistCm > OBSTACLE_SIDE_CLEAR) sideClear = true;
-                } else {
-                    // We turned right, so obstacle is to our left
-                    if (leftDistCm > OBSTACLE_SIDE_CLEAR) sideClear = true;
-                }
-
-                // If side is clear or maximum pass timeout reached, begin return
-                if (sideClear || (now - stateStartTimeMs >= PASS_TIMEOUT_MS)) {
-                    currentState = STATE_RETURN;
-                    stateStartTimeMs = now;
-                    motorsSetSpeed(PWM_TURN);
-                    if (avoidDirection == AVOID_LEFT) {
-                        motorsTurnRight(); // Counter-steer right
-                    } else {
-                        motorsTurnLeft();  // Counter-steer left
-                    }
-                    Serial.println("[FSM] -> Entered STATE_RETURN (Counter-steering to original lane)");
-                }
-            }
-            break;
-
-        case STATE_RETURN:
-            // Counter-steer for same turn duration to re-align heading
-            if (now - stateStartTimeMs >= RETURN_DURATION_MS) {
-                avoidDirection = AVOID_NONE;
-                currentState = (potholeFlag == 1) ? STATE_SLOW : STATE_CRUISE;
-                motorsSetSpeed(potholeFlag ? PWM_SLOW : PWM_CRUISE);
-                motorsForward();
-                Serial.println("[FSM] -> Evasion complete. Resuming drive heading.");
-            }
-            break;
-
-        case STATE_BLOCKED:
-            motorsStop();
-            if (now - lastBlockedRetryMs >= BLOCKED_RETRY_MS) {
-                lastBlockedRetryMs = now;
-                Serial.println("[FSM] Retrying assessment from BLOCKED state...");
-                if (frontDistCm > OBSTACLE_FRONT_THRESH || leftDistCm > OBSTACLE_DEADLOCK || rightDistCm > OBSTACLE_DEADLOCK) {
-                    Serial.println("[FSM] Obstacle cleared! Resuming autonomous drive.");
-                    currentState = STATE_CRUISE;
-                }
-            }
-            break;
-    }
-}
-
-// ======================================================================================
-// FAIL-SAFE MONITORS
-// ======================================================================================
-
-void checkFailSafes() {
-    unsigned long now = millis();
-
-    // 1. Laptop Heartbeat Watchdog: If laptop is silent for > 5s, reset pothole flag
-    if (potholeFlag == 1 && (now - lastLaptopCmdMs > LAPTOP_HEARTBEAT_TIMEOUT_MS)) {
-        Serial.println("[FAILSAFE] Laptop command heartbeat timeout. Resetting pothole slowdown to cruise.");
-        potholeFlag = 0;
-    }
-
-    // 2. Wi-Fi Background Auto-Recovery
-    if (now - lastWifiCheckMs > 5000) {
-        lastWifiCheckMs = now;
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[WIFI WATCHDOG] Connection lost. Attempting reconnect...");
-            WiFi.reconnect();
-        }
-    }
-}
-
-// ======================================================================================
-// SETUP & MAIN LOOP
-// ======================================================================================
-
-void setup() {
-    Serial.begin(115200);
-    delay(500);
-
-    Serial.println("\n========================================================");
-    Serial.println("  AI-Driven Pothole Identification & Obstacle Avoidance ");
-    Serial.println("         ESP8266 Main Vehicle Motion Controller         ");
-    Serial.println("========================================================");
-
-    motorsInit();
-    ultrasonicsInit();
-
-    // Connect to Wi-Fi
-    Serial.printf("[WIFI] Connecting to %s...\n", WIFI_SSID);
+    // Connect to Normal Wi-Fi Router (Station Mode with Internet Access)
+    Serial.printf("[WIFI] Connecting to SSID: %s\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-    int retries = 0;
-    while (WiFi.status() != WL_CONNECTED && retries < 25) {
-        delay(400);
+    int retryCount = 0;
+    while (WiFi.status() != WL_CONNECTED && retryCount < 40) {
+        delay(300);
         Serial.print(".");
-        retries++;
+        retryCount++;
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WIFI] Connected!");
-        Serial.print("[WIFI] Vehicle Controller IP: ");
+        Serial.println("\n[WIFI] Connected to Wi-Fi successfully!");
+        Serial.print("[WIFI] Vehicle IP Address: ");
         Serial.println(WiFi.localIP());
-
-        // Setup REST Server
-        setupHttpServer();
-
-        // Enqueue system online boot message
-        String bootMsg = String("🤖 Pothole Avoidance Robot Online!\nIP: ") + WiFi.localIP().toString();
-        enqueueTelegramAlert(bootMsg, ALERT_BOOT);
+        Serial.print("[WIFI] Open Dashboard at: http://");
+        Serial.println(WiFi.localIP());
     } else {
-        Serial.println("\n[WIFI] Connection failed. Running in autonomous offline mode.");
+        Serial.println("\n[WIFI] Wi-Fi connection timed out. Starting fallback AP mode...");
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP("pothole car", "123456789");
+        Serial.print("[WIFI] Fallback AP IP: ");
+        Serial.println(WiFi.softAPIP());
     }
 
-    lastLaptopCmdMs = millis();
-    Serial.println("[SYSTEM] Vehicle state machine active in CRUISE mode.");
+    // Setup Web Server Routes (Both API and direct routes)
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/status", HTTP_GET, handleStatus);
+    server.on("/pothole", HTTP_GET, handlePothole);
+    server.on("/drive", HTTP_GET, handleDrive);
+    server.on("/mode", HTTP_GET, handleMode);
+
+    // Direct User Test Routes
+    server.on("/forward", HTTP_GET, []() {
+        if (!isAutoMode) {
+            digitalWrite(PIN_MOTOR_PWM, HIGH);
+            moveForward();
+        }
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+    });
+    server.on("/backward", HTTP_GET, []() {
+        if (!isAutoMode) {
+            digitalWrite(PIN_MOTOR_PWM, HIGH);
+            moveBackward();
+        }
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+    });
+    server.on("/left", HTTP_GET, []() {
+        if (!isAutoMode) {
+            digitalWrite(PIN_MOTOR_PWM, HIGH);
+            turnLeft();
+        }
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+    });
+    server.on("/right", HTTP_GET, []() {
+        if (!isAutoMode) {
+            digitalWrite(PIN_MOTOR_PWM, HIGH);
+            turnRight();
+        }
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+    });
+    server.on("/stop", HTTP_GET, []() {
+        if (!isAutoMode) {
+            stopMotors();
+        }
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+    });
+    server.on("/auto", HTTP_GET, []() {
+        isAutoMode = true;
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+    });
+    server.on("/manual", HTTP_GET, []() {
+        isAutoMode = false;
+        stopMotors();
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send(200, "text/plain", "OK");
+    });
+
+    server.begin();
+    Serial.println("[HTTP] Web Server started on port 80.\n");
 }
 
 void loop() {
-    unsigned long now = millis();
-
-    // 1. Service HTTP Client Requests
     server.handleClient();
 
-    // 2. Periodic Ultrasonic Acquisition (every 65 ms ~ 15 Hz)
-    if (now - lastUsSampleMs >= US_SAMPLE_INTERVAL_MS) {
-        lastUsSampleMs = now;
-        sampleUltrasonicsParallel();
+    if (isAutoMode) {
+        runAutonomousMode();
+    } else {
+        // In manual mode, take periodic distance measurements for web dashboard
+        static unsigned long lastManualSample = 0;
+        if (millis() - lastManualSample >= 250) {
+            lastManualSample = millis();
+            distFront = getDistance(PIN_US_ECHO_FRONT);
+            delay(30);
+            distLeft  = getDistance(PIN_US_ECHO_LEFT);
+            delay(30);
+            distRight = getDistance(PIN_US_ECHO_RIGHT);
+        }
     }
-
-    // 3. Step Autonomous State Machine
-    executeStateMachine();
-
-    // 4. Dispatch Queued Telegram Alerts (between motor ticks)
-    processTelegramQueue();
-
-    // 5. Run Safety Watchdogs
-    checkFailSafes();
 }

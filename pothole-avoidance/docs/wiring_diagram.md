@@ -25,7 +25,7 @@ graph TD
         D2["D2 (GPIO4)"] -->|"IN2"| L298N_IN2["L298N IN2"]
         D3["D3 (GPIO0) + 10k PU"] -->|"IN3"| L298N_IN3["L298N IN3"]
         D8["D8 (GPIO15) + 10k PD"] -->|"IN4"| L298N_IN4["L298N IN4"]
-        D4["D4 (GPIO2) + 10k PU"] -->|"ENA + ENB (PWM Speed)"| L298N_EN["L298N ENA & ENB Tied"]
+        D4["D4 (GPIO2) - Free / Unused"]
         D5["D5 (GPIO14)"] -->|"Shared TRIG"| US_TRIG["All 3 HC-SR04 TRIG Pins"]
         VD_FRONT["1k/2k Divider"] -->|"3.3V Echo"| D6["D6 (GPIO12) - ECHO Front"]
         VD_LEFT["1k/2k Divider"] -->|"3.3V Echo"| D7["D7 (GPIO13) - ECHO Left"]
@@ -56,7 +56,7 @@ graph TD
 | **D2** | GPIO4 | L298N IN2 | Left Motor Dir B | Direct connection. Safe boot pin. |
 | **D3** | GPIO0 | L298N IN3 | Right Motor Dir A | **CRITICAL BOOT PIN**: Must be HIGH at power-up. Add an external **10 kΩ pull-up resistor to 3.3V** to prevent L298N input circuitry from holding it low (which would force UART flash download mode). |
 | **D8** | GPIO15 | L298N IN4 | Right Motor Dir B | **CRITICAL BOOT PIN**: Must be LOW at power-up. Add an external **4.7 kΩ to 10 kΩ pull-down resistor to GND** to guarantee logic low during reset. |
-| **D4** | GPIO2 | L298N ENA + ENB | Speed PWM (0–255) | **BOOT PIN**: Must be HIGH at power-up. Remove L298N jumper caps from ENA/ENB, tie both ENA and ENB to D4. Add a **10 kΩ pull-up resistor to 3.3V** (NodeMCU onboard blue LED is also attached here). |
+| **D4** | GPIO2 | Free / Disconnected | None | **FREE PIN**: No enable pin needed. Keep the factory black jumper caps installed on L298N ENA and ENB (internally tied to 5V). No external pull-up resistor is required on D4. |
 | **D5** | GPIO14 | HC-SR04 Shared TRIG | 10 µs Trigger Pulse | Drives the TRIG pin of FRONT, LEFT, and RIGHT sensors in parallel. Output is 3.3V, which reliably triggers HC-SR04 (TTL threshold is ~2.0V). |
 | **D6** | GPIO12 | HC-SR04 FRONT ECHO | Echo Pulse Input | Connect via **Voltage Divider (1kΩ series + 2kΩ to GND)**. Direct 5V from sensor will damage the ESP8266! |
 | **D7** | GPIO13 | HC-SR04 LEFT ECHO | Echo Pulse Input | Connect via **Voltage Divider (1kΩ series + 2kΩ to GND)**. Direct 5V from sensor will damage the ESP8266! |
@@ -90,8 +90,8 @@ graph TD
 | **VMS (12V Input)** | Battery Positive (+) | 7.4V to 11.1V from Li-ion/LiPo battery pack. |
 | **GND** | Battery Negative (-) & Common GND | Common ground reference. |
 | **5V (Logic In/Out)** | Disconnected or 5V | If battery is $> 12\text{V}$, remove the onboard 5V regulator jumper. If battery is 7.4V–11.1V, onboard regulator jumper may remain ON. Do NOT connect L298N 5V output to the buck converter output. |
-| **ENA** | D4 (GPIO2) via jumper bridge to ENB | Left motor speed control via ESP8266 hardware PWM. (Remove stock black jumper). |
-| **ENB** | D4 (GPIO2) tied together with ENA | Right motor speed control via ESP8266 hardware PWM. (Remove stock black jumper). |
+| **ENA** | Factory Jumper Cap ON (+5V) | Left motor permanently enabled via onboard 5V pull-up jumper. No microcontroller connection. |
+| **ENB** | Factory Jumper Cap ON (+5V) | Right motor permanently enabled via onboard 5V pull-up jumper. No microcontroller connection. |
 | **IN1** | D1 (GPIO5) | Left Motor direction control 1. |
 | **IN2** | D2 (GPIO4) | Left Motor direction control 2. |
 | **IN3** | D3 (GPIO0) [with 10k pull-up] | Right Motor direction control 1. |
@@ -104,6 +104,8 @@ graph TD
 ## 3. Voltage Level Shifter Schematic (HC-SR04 ECHO lines)
 
 The HC-SR04 ultrasonic sensor requires $5.0\text{V}$ $V_{CC}$ to operate reliably. Its `ECHO` output pin transitions between $0\text{V}$ and $5\text{V}$. Because the ESP8266 GPIO inputs are rated for a maximum of $3.3\text{V}$, feeding a $5\text{V}$ echo signal directly will degrade or permanently destroy the ESP8266 internal I/O clamping structures.
+
+Ultrasonic detection range is tuned to a maximum limit of **60.0 cm** (with echo timeout reduced from 23.5 ms down to 3.6 ms). This provides an ultra-fast sampling cycle (~20 Hz) without blocking the ESP8266 loop.
 
 Construct three identical passive resistor dividers as follows:
 
@@ -176,8 +178,8 @@ $$V_{\text{ESP}} = V_{\text{ECHO}} \times \frac{R_2}{R_1 + R_2} = 5.0\text{ V} \
        |             D8/GPIO15 |---------------------------------------->| IN4 (Right Rev)   |
        |                       |                                         |                   |
        |  +3.3V --[ 10k PU ]--+|                                         |                   |
-       |              D4/GPIO2 |--------------------+------------------->| ENA (Left PWM)    |
-       |                       |                    +------------------->| ENB (Right PWM)   |
+       |              D4/GPIO2 | (Free / Disconnected)                   | [ENA Jumper ON]   |
+       |                       |                                         | [ENB Jumper ON]   |
        +-----------------------+                                         +-------------------+
 
        ========================================================================================

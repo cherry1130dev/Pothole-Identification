@@ -87,9 +87,14 @@ class FreshFrameCapture:
         self.last_frame_timestamp = time.time()
         self.frame_delay = 0.033
 
+        self.is_http = isinstance(src_url, str) and (src_url.startswith("http://") or src_url.startswith("https://"))
+        self.connected = False
+
         if self.is_sim:
             self.connected = True
             print("[STREAM] Running in Road Simulation mode ('sim').")
+        elif self.is_http:
+            print(f"[STREAM] Connecting to Network MJPEG Stream: {self.src_url}")
         else:
             if isinstance(src_url, str) and src_url.isdigit():
                 idx = int(src_url)
@@ -167,6 +172,36 @@ class FreshFrameCapture:
                     self.latest_frame = frame
                     self.last_frame_timestamp = time.time()
                 time.sleep(0.04)  # ~25 FPS
+                continue
+
+            if self.is_http:
+                import urllib.request
+                try:
+                    stream = urllib.request.urlopen(self.src_url, timeout=5)
+                    self.connected = True
+                    print(f"[STREAM] Connected to {self.src_url} successfully!")
+                    raw_buf = b''
+                    while self.running:
+                        chunk = stream.read(4096)
+                        if not chunk:
+                            break
+                        raw_buf += chunk
+                        a = raw_buf.find(b'\xff\xd8')
+                        b = raw_buf.find(b'\xff\xd9')
+                        if a != -1 and b != -1 and b > a:
+                            jpg = raw_buf[a:b+2]
+                            raw_buf = raw_buf[b+2:]
+                            if len(raw_buf) > 65536:
+                                raw_buf = b''
+                            dec_frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if dec_frame is not None:
+                                with self.lock:
+                                    self.latest_frame = dec_frame
+                                    self.last_frame_timestamp = time.time()
+                    stream.close()
+                except Exception as e:
+                    self.connected = False
+                    time.sleep(RECONNECT_DELAY_SEC)
                 continue
 
             if not self.cap or not self.cap.isOpened():
@@ -338,6 +373,7 @@ class PotholeAIModel:
 def main():
     parser = argparse.ArgumentParser(description="AI Pothole Identification & Safety Stream Engine")
     parser.add_argument("--stream", type=str, default=STREAM_URL, help=f"ESP32-CAM MJPEG URL, '0' for webcam, or 'sim' for simulated road (default: {STREAM_URL})")
+    parser.add_argument("--flip", action="store_true", help="Rotate camera frame 180 degrees (upside-down fix)")
     parser.add_argument("--force-fallback", action="store_true", help="Force classical OpenCV detector even if weights exist")
     parser.add_argument("--mock", action="store_true", help="Connect to local Mock ESP8266 controller simulator (http://127.0.0.1:8080)")
     parser.add_argument("--esp-url", type=str, default=None, help="Custom ESP8266 controller base URL")
@@ -381,6 +417,7 @@ def main():
 
     # Display & Timing
     show_debug_mask = False
+    rotate_180 = args.flip
     fps_start_time = time.time()
     frame_counter = 0
     total_processed_frames = 0
@@ -406,6 +443,9 @@ def main():
                 if cv2.waitKey(100) & 0xFF == ord('q'):
                     break
                 continue
+
+            if rotate_180:
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
 
             frame_counter += 1
             frame_h, frame_w = frame.shape[:2]
@@ -536,6 +576,9 @@ def main():
                 elif key == ord('d'):
                     show_debug_mask = not show_debug_mask
                     print(f"\n[TOGGLE] Debug mask overlay: {'ON' if show_debug_mask else 'OFF'}")
+                elif key == ord('r'):
+                    rotate_180 = not rotate_180
+                    print(f"\n[TOGGLE] 180° Camera Rotation: {'ON' if rotate_180 else 'OFF'}")
                 elif key == ord('s'):
                     status = esp_client.get_status()
                     print("\n[ESP8266 STATUS QUERY]:", status)

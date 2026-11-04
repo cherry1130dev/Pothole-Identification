@@ -33,18 +33,19 @@ graph TD
     MCU -->|"HTTPS Event Notifications"| TELEGRAM
 ```
 
-### Core Operating Principles
-1. **Pothole Detection & Smooth Slowdown**:
-   - The ESP32-CAM streams video at $320 \times 240$ resolution ($15–25\text{ FPS}$) to the laptop.
-   - The laptop AI evaluates the road Region of Interest (lower 50% of the camera FOV).
-   - Upon confirming a pothole across $N=3$ consecutive frames, the laptop issues `GET /pothole?state=1`.
-   - The ESP8266 smoothly throttles motor speed down to crawl speed ($43\%\text{ PWM}$) so the vehicle traverses the rough patch without abrupt braking or losing steering control.
-   - When the pothole is cleared ($M=10$ clear frames), speed ramps back to normal cruise ($70\%\text{ PWM}$).
-2. **Autonomous Ultrasonic Obstacle Avoidance**:
-   - The ESP8266 samples Front, Left, and Right HC-SR04 ultrasonic sensors at $15\text{ Hz}$ using an optimized parallel-sampling driver.
-   - If an obstacle appears $< 25\text{ cm}$ ahead, obstacle evasion **immediately overrides** road surface state.
-   - The vehicle compares Left and Right clearance, pivots toward the more open side (`AVOID`), overtakes the obstacle (`PASS`), and counter-steers back to its original lane heading (`RETURN`).
-   - If all three directions are blocked ($< 15\text{ cm}$), the vehicle halts safely (`BLOCKED`) and transmits a priority Telegram alert.
+### Core Operating Principles (Standalone AP Mode)
+1. **Self-Hosted Wi-Fi Access Point ("pothole car")**:
+   - The ESP8266 acts as the standalone AP Server (`SSID: "pothole car"`, `Pass: "123456789"`).
+   - ESP8266 Web Dashboard: **`http://192.168.4.1/`** (viewable from any laptop or mobile phone).
+   - ESP32-CAM connects to `pothole car` with static IP **`192.168.4.2`** (Stream: `http://192.168.4.2:81/stream`).
+2. **Pothole Detection & Image Processing (Laptop)**:
+   - Laptop connects to `pothole car` Wi-Fi, ingests stream from `http://192.168.4.2:81/stream`.
+   - Detects potholes using OpenCV / YOLOv8 in real time and sends `GET /pothole?state=1` to `192.168.4.1`.
+   - The vehicle switches to SLOW crawl mode, and the web dashboard updates instantly!
+3. **Deterministic Ultrasonic Avoidance**:
+   - **Center Obstacle (< 25 cm)**: Vehicle STOPS, turns LEFT for 1.0 second, then continues forward.
+   - **Left Obstacle (< 25 cm)**: Vehicle turns RIGHT for 1.5 seconds, then continues forward.
+   - **Right Obstacle (< 25 cm)**: Vehicle turns LEFT for 1.5 seconds, then continues forward.
 
 ---
 
@@ -104,7 +105,7 @@ pothole-avoidance/
        L298N IN1 <---| D1 (GPIO 5)       D5 (GPIO 14) |---> Shared HC-SR04 TRIG (x3)
        L298N IN2 <---| D2 (GPIO 4)       D6 (GPIO 12) |<--- FRONT ECHO (via 1k/2k divider)
    L298N IN3 (PU)<---| D3 (GPIO 0)       D7 (GPIO 13) |<--- LEFT ECHO  (via 1k/2k divider)
- L298N ENA+B (PU)<---| D4 (GPIO 2)       D0 (GPIO 16) |<--- RIGHT ECHO (via 1k/2k divider)
+  [FREE / Unused]<---| D4 (GPIO 2)       D0 (GPIO 16) |<--- RIGHT ECHO (via 1k/2k divider)
    L298N IN4 (PD)<---| D8 (GPIO 15)               VIN |<--- 5.0V Regulated from Buck Converter
                      | GND                        GND |---> Common System Star Ground
                      +----------------------------+
@@ -114,7 +115,8 @@ pothole-avoidance/
 > **Critical Bootstrapping Pin Safeguards:**
 > - **D3 (GPIO0)**: Connected to L298N IN3. Add an external **$10\text{ k}\Omega$ pull-up resistor to 3.3V**. If held low at boot, the ESP enters UART flash mode and never runs code!
 > - **D8 (GPIO15)**: Connected to L298N IN4. Add an external **$10\text{ k}\Omega$ pull-down resistor to GND**. Must be low at boot.
-> - **D4 (GPIO2)**: Tied to L298N ENA+ENB. Add an external **$10\text{ k}\Omega$ pull-up resistor to 3.3V**.
+> - **No Enable Pin Needed**: Keep the factory black jumpers on L298N **ENA** and **ENB** (connects both permanently to +5V). **D4 (GPIO2)** is left disconnected / free, so no external resistor is needed on D4!
+> - **Ultrasonic Max Limit (60 cm)**: Tuned to **60 cm** maximum detection distance with a fast 3.6 ms timeout for ultra-fast loop cycles.
 
 For comprehensive schematics and ASCII diagrams, consult [docs/wiring_diagram.md](file:///c:/Users/chara/Desktop/Pothole%20Identification/pothole-avoidance/docs/wiring_diagram.md).
 
