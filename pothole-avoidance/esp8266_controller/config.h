@@ -12,11 +12,12 @@
 #include <Arduino.h>
 
 // ======================================================================================
-// 1. WI-FI ROUTER CREDENTIALS (Normal Wi-Fi Station Mode with Internet for Telegram)
+// 1. DEVICE HOTSPOT WI-FI CREDENTIALS (Station Mode - connects to "Pothole car")
 // ======================================================================================
-#define WIFI_SSID               "Easitronics"
+#define WIFI_SSID               "Pothole car"
 #define WIFI_PASSWORD           "123456789"
 #define HTTP_SERVER_PORT        80
+#define CAM_DISCOVERY_UDP_PORT  4210
 
 // ======================================================================================
 // 2. HARDWARE PIN DEFINITIONS (NodeMCU ESP8266)

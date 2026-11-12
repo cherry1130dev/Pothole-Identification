@@ -1,31 +1,34 @@
 /**
  * ======================================================================================
  * PROJECT: AI-Driven Pothole Identification and Smart Obstacle Avoidance System
- * MODULE:  ESP8266 Main Vehicle Motion & Safety Controller (Station Mode with Internet)
+ * MODULE:  ESP8266 Main Vehicle Motion & Safety Controller
  * FILE:    esp8266_controller.ino
  * ======================================================================================
  * 
  * DESCRIPTION:
- * 1. Connects to local Wi-Fi Router (Station Mode) so Telegram messages work reliably!
- * 2. Uses proven, rock-solid ultrasonic measurement via getDistance(echoPin) with pulseIn.
- * 3. Obstacle Avoidance Rules:
+ * 1. Connects to Device Hotspot (Station Mode: SSID "Pothole car" / "123456789")
+ *    so the dashboard & Telegram alerts have full internet access.
+ * 2. Auto-discovers the ESP32-CAM IP via UDP broadcast on port 4210.
+ * 3. Uses rock-solid ultrasonic measurement via getDistance(echoPin) with pulseIn.
+ * 4. Obstacle Avoidance Rules:
  *    - Center detected (<= 20 cm): Stop -> Turn LEFT for 1.0 sec -> Continue path
  *    - Left detected (<= 20 cm):   Turn RIGHT for 1.5 sec -> Continue path
  *    - Right detected (<= 20 cm):  Turn LEFT for 1.5 sec -> Continue path
- * 4. Pothole Detection Integration:
- *    - Receives /pothole?state=1 from Laptop AI -> Decelerates to SLOW crawl mode.
- *    - Receives /pothole?state=0 from Laptop AI -> Resumes CRUISE speed.
- * 5. Serves Web Control Dashboard from dashboard.h at http://<ESP8266_IP>/
+ * 5. Pothole Detection Integration (Driven directly by Dashboard Image Processing):
+ *    - Receives /pothole?state=1 -> Decelerates to SLOW crawl mode.
+ *    - Receives /pothole?state=0 -> Resumes CRUISE speed.
+ * 6. Serves All-in-One Web Control + AI Image Processing Dashboard from dashboard.h.
  * ======================================================================================
  */
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <WiFiUdp.h>
 #include "config.h"
 #include "dashboard.h"
 
 // ======================================================================================
-// FORWARD DECLARATIONS (Prevents compiler scope errors)
+// FORWARD DECLARATIONS
 // ======================================================================================
 void moveForward();
 void moveBackward();
@@ -34,6 +37,8 @@ void turnRight();
 void stopMotors();
 void setMotorSpeed(uint8_t speed);
 long getDistance(uint8_t echoPin);
+void safeDelay(unsigned long ms);
+void checkCamDiscovery();
 void runAutonomousMode();
 void handleRoot();
 void handleStatus();
@@ -53,6 +58,10 @@ long distFront = 999;
 long distLeft  = 999;
 long distRight = 999;
 
+// Auto-discovered ESP32-CAM IP on the Hotspot
+String discoveredCamIp = "";
+WiFiUDP udpDiscovery;
+
 ESP8266WebServer server(HTTP_SERVER_PORT);
 
 
@@ -70,7 +79,11 @@ void setMotorSpeed(uint8_t speed) {
 }
 
 void moveForward() {
-    digitalWrite(PIN_MOTOR_PWM, HIGH);
+    if (potholeFlag == 1) {
+        analogWrite(PIN_MOTOR_PWM, PWM_SLOW);
+    } else {
+        digitalWrite(PIN_MOTOR_PWM, HIGH);
+    }
     digitalWrite(PIN_MOTOR_IN1, HIGH); digitalWrite(PIN_MOTOR_IN2, LOW);
     digitalWrite(PIN_MOTOR_IN3, HIGH); digitalWrite(PIN_MOTOR_IN4, LOW);
 }
@@ -102,26 +115,53 @@ void stopMotors() {
 
 
 // ======================================================================================
-// ULTRASONIC SENSOR MEASUREMENT (HC-SR04)
+// ULTRASONIC SENSOR MEASUREMENT (HC-SR04) & RESPONSIVE DELAY
 // ======================================================================================
 
 long getDistance(uint8_t echoPin) {
-    // Ensure trigger line is LOW
     digitalWrite(PIN_US_TRIG, LOW);
     delayMicroseconds(2);
 
-    // Send 10us trigger pulse
     digitalWrite(PIN_US_TRIG, HIGH);
     delayMicroseconds(10);
     digitalWrite(PIN_US_TRIG, LOW);
 
-    // Read echo pulse length (timeout at 30ms to prevent blocking too long)
     long duration = pulseIn(echoPin, HIGH, 30000);
+    if (duration == 0) return 999;
 
-    if (duration == 0) return 999; // No echo received, assume clear distance
-
-    // Calculate distance in cm (Speed of sound = 343 m/s)
     return (duration / 2) * 0.0343;
+}
+
+void safeDelay(unsigned long ms) {
+    unsigned long start = millis();
+    while (millis() - start < ms) {
+        server.handleClient();
+        if (!isAutoMode) {
+            return; // Abort maneuver immediately if switched to manual or stopped
+        }
+        yield();
+        delay(5);
+    }
+}
+
+void checkCamDiscovery() {
+    int packetSize = udpDiscovery.parsePacket();
+    if (packetSize > 0) {
+        char buf[64];
+        int len = udpDiscovery.read(buf, sizeof(buf) - 1);
+        if (len > 0) {
+            buf[len] = '\0';
+            String msg = String(buf);
+            if (msg.startsWith("POTHOLE_CAM:")) {
+                String newIp = msg.substring(12);
+                newIp.trim();
+                if (newIp.length() > 6 && newIp != discoveredCamIp) {
+                    discoveredCamIp = newIp;
+                    Serial.printf("[DISCOVERY] ESP32-CAM found at: http://%s:81/stream\n", discoveredCamIp.c_str());
+                }
+            }
+        }
+    }
 }
 
 
@@ -132,19 +172,22 @@ long getDistance(uint8_t echoPin) {
 void runAutonomousMode() {
     // 1. Read Front distance
     distFront = getDistance(PIN_US_ECHO_FRONT);
-    delay(30); // Prevent acoustic crosstalk between sensor readings
+    safeDelay(30);
+    if (!isAutoMode) return;
 
     // Rule 1: Center obstacle detected (<= 20 cm) -> STOP, then turn LEFT for 1.0 sec, continue forward
     if (distFront <= OBSTACLE_THRESH) {
         Serial.printf("[AVOID] Center obstacle (%ld cm) -> STOP & Turn LEFT for 1.0s\n", distFront);
         stopMotors();
-        delay(150);
+        safeDelay(150);
+        if (!isAutoMode) return;
 
-        digitalWrite(PIN_MOTOR_PWM, HIGH);
         turnLeft();
-        delay(TURN_CENTER_MS); // 1.0 sec (1000 ms)
+        safeDelay(TURN_CENTER_MS); // 1.0 sec (1000 ms)
+        if (!isAutoMode) return;
         stopMotors();
-        delay(100);
+        safeDelay(100);
+        if (!isAutoMode) return;
 
         moveForward();
         return;
@@ -152,16 +195,18 @@ void runAutonomousMode() {
 
     // 2. Read Left distance
     distLeft = getDistance(PIN_US_ECHO_LEFT);
-    delay(30);
+    safeDelay(30);
+    if (!isAutoMode) return;
 
-    // Rule 2: Left obstacle detected (<= 20 cm) -> Turn RIGHT for 1.5 sec, continue forward
+    // Rule 2: Left obstacle detected (<= 20 cm) -> Reversed turn call so robot moves away to right
     if (distLeft <= OBSTACLE_THRESH) {
-        Serial.printf("[AVOID] Left obstacle (%ld cm) -> Turn RIGHT for 1.5s\n", distLeft);
-        digitalWrite(PIN_MOTOR_PWM, HIGH);
-        turnRight();
-        delay(TURN_LEFT_MS); // 1.5 sec (1500 ms)
+        Serial.printf("[AVOID] Left obstacle (%ld cm) -> Avoid RIGHT (turnLeft) for 1.5s\n", distLeft);
+        turnLeft();
+        safeDelay(TURN_LEFT_MS); // 1.5 sec (1500 ms)
+        if (!isAutoMode) return;
         stopMotors();
-        delay(100);
+        safeDelay(100);
+        if (!isAutoMode) return;
 
         moveForward();
         return;
@@ -169,30 +214,25 @@ void runAutonomousMode() {
 
     // 3. Read Right distance
     distRight = getDistance(PIN_US_ECHO_RIGHT);
-    delay(30);
+    safeDelay(30);
+    if (!isAutoMode) return;
 
-    // Rule 3: Right obstacle detected (<= 20 cm) -> Turn LEFT for 1.5 sec, continue forward
+    // Rule 3: Right obstacle detected (<= 20 cm) -> Reversed turn call so robot moves away to left
     if (distRight <= OBSTACLE_THRESH) {
-        Serial.printf("[AVOID] Right obstacle (%ld cm) -> Turn LEFT for 1.5s\n", distRight);
-        digitalWrite(PIN_MOTOR_PWM, HIGH);
-        turnLeft();
-        delay(TURN_RIGHT_MS); // 1.5 sec (1500 ms)
+        Serial.printf("[AVOID] Right obstacle (%ld cm) -> Avoid LEFT (turnRight) for 1.5s\n", distRight);
+        turnRight();
+        safeDelay(TURN_RIGHT_MS); // 1.5 sec (1500 ms)
+        if (!isAutoMode) return;
         stopMotors();
-        delay(100);
+        safeDelay(100);
+        if (!isAutoMode) return;
 
         moveForward();
         return;
     }
 
-    // Road Clear -> Drive Forward
-    // If Laptop AI signals a pothole, slow down
-    if (potholeFlag == 1) {
-        analogWrite(PIN_MOTOR_PWM, PWM_SLOW); // Slow crawl for rough road
-        moveForward();
-    } else {
-        digitalWrite(PIN_MOTOR_PWM, HIGH);     // Full cruise power
-        moveForward();
-    }
+    // Road Clear -> Drive Forward (respecting pothole slowdown flag)
+    moveForward();
 }
 
 
@@ -212,7 +252,9 @@ void handleStatus() {
     json += "\"left\":" + String(distLeft) + ",";
     json += "\"right\":" + String(distRight) + ",";
     json += "\"pothole\":" + String(potholeFlag) + ",";
-    json += "\"speed\":" + String(currentSpeed);
+    json += "\"speed\":" + String(currentSpeed) + ",";
+    json += "\"cam_ip\":\"" + discoveredCamIp + "\",";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
     json += "}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", json);
@@ -237,7 +279,6 @@ void handleDrive() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
     if (server.hasArg("cmd")) {
         isAutoMode = false;
-        digitalWrite(PIN_MOTOR_PWM, HIGH);
         String cmd = server.arg("cmd");
         cmd.toUpperCase();
         char c = cmd.charAt(0);
@@ -289,7 +330,6 @@ void setup() {
     pinMode(PIN_MOTOR_IN4, OUTPUT);
     pinMode(PIN_MOTOR_PWM, OUTPUT);
 
-    // Hold PWM HIGH to keep motors enabled with maximum torque
     digitalWrite(PIN_MOTOR_PWM, HIGH);
     stopMotors();
     Serial.println("[MOTORS] L298N initialized and stopped.");
@@ -302,43 +342,44 @@ void setup() {
     pinMode(PIN_US_ECHO_RIGHT, INPUT);
     Serial.println("[ULTRASONICS] Sensors initialized.");
 
-    // Connect to Normal Wi-Fi Router (Station Mode with Internet Access)
-    Serial.printf("[WIFI] Connecting to SSID: %s\n", WIFI_SSID);
+    // Connect to Device Hotspot (Station Mode: "Pothole car")
+    Serial.printf("[WIFI] Connecting to Hotspot SSID: %s\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     int retryCount = 0;
-    while (WiFi.status() != WL_CONNECTED && retryCount < 40) {
-        delay(300);
+    while (WiFi.status() != WL_CONNECTED && retryCount < 45) {
+        delay(400);
         Serial.print(".");
         retryCount++;
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WIFI] Connected to Wi-Fi successfully!");
+        Serial.println("\n[WIFI] Connected to Hotspot successfully!");
         Serial.print("[WIFI] Vehicle IP Address: ");
         Serial.println(WiFi.localIP());
         Serial.print("[WIFI] Open Dashboard at: http://");
         Serial.println(WiFi.localIP());
     } else {
-        Serial.println("\n[WIFI] Wi-Fi connection timed out. Starting fallback AP mode...");
-        WiFi.mode(WIFI_AP);
-        WiFi.softAP("pothole car", "123456789");
-        Serial.print("[WIFI] Fallback AP IP: ");
-        Serial.println(WiFi.softAPIP());
+        Serial.println("\n[WIFI] Still waiting for Hotspot 'Pothole car' (will auto-connect when available)...");
     }
 
-    // Setup Web Server Routes (Both API and direct routes)
+    // Start UDP Listener for ESP32-CAM Auto-Discovery
+    udpDiscovery.begin(CAM_DISCOVERY_UDP_PORT);
+    Serial.printf("[DISCOVERY] Listening for ESP32-CAM beacon on UDP port %d\n", CAM_DISCOVERY_UDP_PORT);
+
+    // Setup Web Server Routes
     server.on("/", HTTP_GET, handleRoot);
     server.on("/status", HTTP_GET, handleStatus);
     server.on("/pothole", HTTP_GET, handlePothole);
     server.on("/drive", HTTP_GET, handleDrive);
     server.on("/mode", HTTP_GET, handleMode);
 
-    // Direct User Test Routes
+    // Direct Control Routes
     server.on("/forward", HTTP_GET, []() {
         if (!isAutoMode) {
-            digitalWrite(PIN_MOTOR_PWM, HIGH);
             moveForward();
         }
         server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -346,7 +387,6 @@ void setup() {
     });
     server.on("/backward", HTTP_GET, []() {
         if (!isAutoMode) {
-            digitalWrite(PIN_MOTOR_PWM, HIGH);
             moveBackward();
         }
         server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -354,7 +394,6 @@ void setup() {
     });
     server.on("/left", HTTP_GET, []() {
         if (!isAutoMode) {
-            digitalWrite(PIN_MOTOR_PWM, HIGH);
             turnLeft();
         }
         server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -362,16 +401,14 @@ void setup() {
     });
     server.on("/right", HTTP_GET, []() {
         if (!isAutoMode) {
-            digitalWrite(PIN_MOTOR_PWM, HIGH);
             turnRight();
         }
         server.sendHeader("Access-Control-Allow-Origin", "*");
         server.send(200, "text/plain", "OK");
     });
     server.on("/stop", HTTP_GET, []() {
-        if (!isAutoMode) {
-            stopMotors();
-        }
+        isAutoMode = false;
+        stopMotors();
         server.sendHeader("Access-Control-Allow-Origin", "*");
         server.send(200, "text/plain", "OK");
     });
@@ -393,19 +430,28 @@ void setup() {
 
 void loop() {
     server.handleClient();
+    checkCamDiscovery();
+
+    // Wi-Fi IP announcement when reconnected after boot
+    static bool wasConnected = (WiFi.status() == WL_CONNECTED);
+    bool isConnected = (WiFi.status() == WL_CONNECTED);
+    if (isConnected && !wasConnected) {
+        Serial.printf("\n[WIFI] Connected! Dashboard: http://%s/\n", WiFi.localIP().toString().c_str());
+    }
+    wasConnected = isConnected;
 
     if (isAutoMode) {
         runAutonomousMode();
     } else {
-        // In manual mode, take periodic distance measurements for web dashboard
+        // Non-blocking round-robin ultrasonic sampling (1 sensor per 90ms cycle)
         static unsigned long lastManualSample = 0;
-        if (millis() - lastManualSample >= 250) {
+        static uint8_t sensorIdx = 0;
+        if (millis() - lastManualSample >= 90) {
             lastManualSample = millis();
-            distFront = getDistance(PIN_US_ECHO_FRONT);
-            delay(30);
-            distLeft  = getDistance(PIN_US_ECHO_LEFT);
-            delay(30);
-            distRight = getDistance(PIN_US_ECHO_RIGHT);
+            if (sensorIdx == 0) distFront = getDistance(PIN_US_ECHO_FRONT);
+            else if (sensorIdx == 1) distLeft  = getDistance(PIN_US_ECHO_LEFT);
+            else distRight = getDistance(PIN_US_ECHO_RIGHT);
+            sensorIdx = (sensorIdx + 1) % 3;
         }
     }
 }

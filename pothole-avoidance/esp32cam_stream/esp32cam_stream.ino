@@ -39,25 +39,21 @@
 
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include "esp_http_server.h"
-#include "esp_timer.h"
 #include "img_converters.h"
-#include "fb_gfx.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
 // ======================================================================================
-// USER NETWORK CONFIGURATION (CONNECTED TO ESP8266 AP: "pothole car")
+// USER NETWORK CONFIGURATION (Device Hotspot: "Pothole car")
 // ======================================================================================
-const char* WIFI_SSID     = "Easitronics";
+const char* WIFI_SSID     = "Pothole car";
 const char* WIFI_PASSWORD = "123456789";
 
-// Static IP Configuration on ESP8266 AP Subnet (192.168.4.2)
-const bool  USE_STATIC_IP = false;
-IPAddress   local_IP(192, 168, 4, 2);
-IPAddress   gateway(192, 168, 4, 1);
-IPAddress   subnet(255, 255, 255, 0);
-IPAddress   primaryDNS(192, 168, 4, 1);
+WiFiUDP camUdp;
+const uint16_t CAM_DISCOVERY_UDP_PORT = 4210;
+unsigned long last_beacon_ms = 0;
 
 // ======================================================================================
 // AI-THINKER ESP32-CAM PIN DEFINITIONS
@@ -162,10 +158,6 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 }
 
 // ======================================================================================
-// START HTTP STREAM SERVER ON PORT 81
-// ======================================================================================
-
-// ======================================================================================
 // RUNTIME CAMERA SENSOR CONTROL HANDLER (/control?var=vflip&val=0|1)
 // ======================================================================================
 static esp_err_t cmd_handler(httpd_req_t *req) {
@@ -216,6 +208,11 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     return httpd_resp_send(req, "OK", 2);
 }
 
+static esp_err_t ping_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "POTHOLE_CAM", 11);
+}
+
 void startCameraServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 81;
@@ -239,6 +236,14 @@ void startCameraServer() {
             .user_ctx  = NULL
         };
         httpd_register_uri_handler(stream_httpd, &cmd_uri);
+
+        httpd_uri_t ping_uri = {
+            .uri       = "/ping",
+            .method    = HTTP_GET,
+            .handler   = ping_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(stream_httpd, &ping_uri);
 
         Serial.println("[HTTP] Stream server started successfully!");
     } else {
@@ -317,13 +322,6 @@ bool initCamera() {
 void connectWiFi() {
     Serial.printf("[WIFI] Connecting to SSID: %s\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
-
-    if (USE_STATIC_IP) {
-        WiFi.config(local_IP, gateway, subnet, primaryDNS);
-        Serial.print("[WIFI] Static IP configured: ");
-        Serial.println(local_IP);
-    }
-
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
     int attempts = 0;
@@ -347,9 +345,9 @@ void wifiWatchdog() {
     if (millis() - last_wifi_check_ms > WIFI_CHECK_INTERVAL_MS) {
         last_wifi_check_ms = millis();
         if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[WIFI WATCHDOG] Connection dropped! Attempting reconnect...");
+            Serial.println("[WIFI WATCHDOG] Not connected to 'Pothole car'! Retrying...");
             WiFi.disconnect();
-            WiFi.reconnect();
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         }
     }
 }
@@ -392,8 +390,22 @@ void setup() {
     Serial.println("[SYSTEM] Ready! Point your browser or Python script to the stream URL.");
 }
 
+void broadcastCamIP() {
+    if (WiFi.status() == WL_CONNECTED && (millis() - last_beacon_ms >= 3000)) {
+        last_beacon_ms = millis();
+        IPAddress broadcastIp = WiFi.localIP();
+        broadcastIp[3] = 255; // Subnet broadcast (e.g. 192.168.43.255)
+        String msg = "POTHOLE_CAM:" + WiFi.localIP().toString();
+        camUdp.beginPacket(broadcastIp, CAM_DISCOVERY_UDP_PORT);
+        camUdp.print(msg);
+        camUdp.endPacket();
+    }
+}
+
 void loop() {
     // Keep Wi-Fi connection alive
     wifiWatchdog();
+    // Broadcast IP so ESP8266 Dashboard auto-discovers camera stream URL
+    broadcastCamIP();
     delay(100);
 }
